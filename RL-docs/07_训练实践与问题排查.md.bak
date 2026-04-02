@@ -1,0 +1,636 @@
+## ROLL 训练实践与问题排查
+
+> 本文档基于高德地图 Agentic RL 项目的**真实训练经验**，记录从环境搭建、SFT 冷启动、RL 训练到问题排查的完整实践过程。涵盖 11 轮 SFT 迭代、11+ 轮 RL 版本迭代中积累的参数选择、Reward 设计、数据筛选策略和踩坑记录。
+>
+> **代码仓库**：`https://code.alibaba-inc.com/yetianchen.ytc/Roll_for_amap`
+
+---
+
+### 一、环境准备
+
+#### 1.1 Docker 环境
+
+统一使用官方 Docker 镜像，避免环境差异导致的问题：
+
+```bash
+# 创建容器（docker/create_container.sh）
+sudo docker run -dit \
+     --cap-add SYS_ADMIN \
+     --gpus all \
+     --name=${USER}_roll_dev \
+     --ipc=host \
+     --net=host \
+     -v /dev/fuse:/dev/fuse \
+     -v /dev/shm:/dev/shm \
+     -v /home/$USER/:/home/$USER/ \
+     -v /var/run/docker.sock:/var/run/docker.sock \
+     -v /mnt/ram:/mnt/ram \
+     roll-registry.cn-hangzhou.cr.aliyuncs.com/roll/pytorch:nvcr-24.05-py3-torch260-vllm084 \
+     /bin/bash
+```
+
+**关键注意事项**：
+- 必须 `--ipc=host --net=host`，否则 NCCL 通信和 Ray 集群会出问题
+- 必须挂载 `/dev/shm`，RL 训练的共享内存需求很大（后续会重新挂载到 81920M）
+- 镜像版本要和 `requirements_torch260_vllm.txt` 匹配，不要混用 torch 版本
+
+#### 1.2 依赖安装
+
+```bash
+# 基础依赖
+pip install -r requirements_common.txt \
+    --trusted-host mirrors.aliyun.com \
+    --index-url https://mirrors.aliyun.com/pypi/simple/
+
+# 根据推理后端选择安装（二选一）
+pip install -r requirements_torch260_vllm.txt    # vLLM 后端
+pip install -r requirements_torch260_sglang.txt   # SGLang 后端
+```
+
+**核心依赖版本约束**（踩坑总结）：
+
+| 依赖 | 版本要求 | 说明 |
+|------|---------|------|
+| `ray[default,cgraph]` | ≥2.48.0 | vLLM 要求，低版本会报 cgraph 错误 |
+| `datasets` | ==3.1.0 | 高版本 API 不兼容 |
+| `peft` | ==0.12.0 | LoRA 相关，版本敏感 |
+| `accelerate` | ==0.34.2 | 与 DeepSpeed 配合使用 |
+| `trl` | ==0.9.6 | LLM Judge Reward Worker 依赖 |
+| `numpy` | <2.0 | numpy 2.0 有大量 breaking changes |
+
+#### 1.3 多节点环境初始化
+
+多节点训练时，`examples/scripts/env_setup.sh` 会自动处理以下事项：
+
+```bash
+source "examples/scripts/env_setup.sh"
+pre_setup_environment
+```
+
+这个脚本做了几件关键的事：
+1. **设置 NCCL 网络接口**：多节点用 `eth0`，单节点用 `bond0`
+2. **扩大 `/dev/shm`**：重新挂载到 81920M，默认大小不够用
+3. **主节点发现**：RANK=0 的节点写入调度文件，其他节点轮询等待
+
+**常见问题**：如果多节点启动后卡住不动，大概率是 RANK≠0 的节点找不到调度文件，检查 OSS 挂载路径 `/data/oss_bucket_0/mdl_schduler_mock/` 是否可写。
+
+#### 1.4 代码拉取与变更同步
+
+```bash
+git fetch
+git cherry-pick <commit-hash>  # 拉取特定变更
+```
+
+---
+
+### 二、RLVR 训练实践
+
+#### 2.1 启动方式
+
+```bash
+# 方式一：本地直接启动（开发调试用）
+bash examples/qwen2.5-7B-rlvr_megatron/run_rlvr_pipeline.sh
+
+# 方式二：通过 Nebula 集群提交（生产训练用）
+bash examples/qwen2.5-7B-rlvr_megatron/submit_pipeline.sh
+
+# 本质上都是执行：
+python examples/start_rlvr_pipeline.py \
+    --config_path qwen2.5-7B-rlvr_megatron \
+    --config_name rlvr_config
+```
+
+#### 2.2 我们实际使用的训练参数（Qwen2.5-7B RLVR）
+
+以下是 `examples/qwen2.5-7B-rlvr_megatron/rlvr_config.yaml` 中的核心参数及其选择理由：
+
+##### 全局参数
+
+| 参数 | 实际值 | 为什么这么设 |
+|------|--------|-------------|
+| `max_steps` | 500 | 7B 模型 RLVR 训练通常 300-500 步就能收敛，再多容易过拟合 |
+| `save_steps` | 100 | 每 100 步存一个 checkpoint，平衡存储开销和恢复粒度 |
+| `eval_steps` | 10 | 每 10 步验证一次，及时发现训练崩溃 |
+| `rollout_batch_size` | 64 | 每步采样 64 个 prompt，乘以 `num_return_sequences_in_group=8` 得到 512 个 response |
+| `prompt_length` | 2048 | prompt 最大长度，覆盖大部分数学/代码题目 |
+| `response_length` | 4096 | response 最大长度，数学推理需要较长的 CoT |
+| `seed` | 42 | 固定随机种子，保证可复现 |
+
+##### RL 策略参数
+
+| 参数 | 实际值 | 为什么这么设 |
+|------|--------|-------------|
+| `num_return_sequences_in_group` | 8 | 每个 prompt 生成 8 个 response，用于 GRPO/Reinforce++ 的组内对比 |
+| `ppo_epochs` | 1 | 每批数据只训练 1 轮，保持 on-policy，RLVR 场景下足够 |
+| `adv_estimator` | reinforce | 使用 Reinforce++ 算法，不需要 Critic 网络，省资源 |
+| `reward_clip` | 10 | 裁剪奖励到 [-10, 10]，防止极端奖励值 |
+| `advantage_clip` | 2.0 | 裁剪优势函数，稳定训练 |
+| `dual_clip_loss` | true | 启用 Dual Clip，限制负 advantage 的更新幅度 |
+| `whiten_advantages` | true | Advantage 白化（标准化），稳定梯度 |
+| `max_len_mask` | true | 过滤达到最大长度的样本（截断的不完整回答没有训练价值） |
+| `difficulty_mask` | true | 过滤过于简单（>95% 正确率）或过于困难（<10% 正确率）的 prompt |
+| `add_token_level_kl` | false | 不加 token 级 KL 惩罚，Reinforce++ 自带基线已经足够 |
+
+##### Actor Train 参数
+
+| 参数 | 实际值 | 为什么这么设 |
+|------|--------|-------------|
+| `learning_rate` | 1.0e-6 | RL 训练学习率要比 SFT 低 1-2 个数量级，防止策略崩溃 |
+| `weight_decay` | 0 | RL 训练通常不加权重衰减 |
+| `per_device_train_batch_size` | 1 | 受显存限制，7B 模型每卡只能放 1 个样本 |
+| `gradient_accumulation_steps` | 32 | 16 卡 × 1 × 32 = 512，与 rollout 生成的 512 个 response 对齐 |
+| `warmup_steps` | 20 | 前 20 步线性预热，避免初始梯度过大 |
+| `dtype` | bf16 | BF16 混合精度，平衡精度和显存 |
+| `disable_gradient_checkpointing` | false | 启用梯度检查点，用计算换显存 |
+| `recompute_granularity` | full | 完整激活重计算，最大化节省显存 |
+
+**batch size 对齐公式**：
+```
+rollout 生成量 = rollout_batch_size × num_return_sequences_in_group = 64 × 8 = 512
+训练消耗量   = per_device_train_batch_size × gradient_accumulation_steps × dp_size
+             = 1 × 32 × 16 = 512  ✅ 对齐
+```
+
+> ⚠️ **这两个值必须相等**，否则训练会报错或数据对不上。如果改了 `rollout_batch_size` 或 `num_return_sequences_in_group`，一定要同步调整 `gradient_accumulation_steps`。
+
+##### Actor Infer 参数
+
+| 参数 | 实际值 | 为什么这么设 |
+|------|--------|-------------|
+| `temperature` | 0.99 | 接近 1.0 的高温度，保证生成多样性（RL 需要探索） |
+| `top_p` | 0.99 | 接近 1.0，配合高温度使用 |
+| `top_k` | 100 | 较大的 top_k，不过度限制采样空间 |
+| `gpu_memory_utilization` | 0.8 | vLLM 显存占用比例，留 20% 给 KV Cache 动态分配 |
+| `max_model_len` | 8000 | prompt_length + response_length = 2048 + 4096 ≈ 6144，留一些余量 |
+
+##### GPU 资源分配（16 卡配置）
+
+```yaml
+actor_train:
+  device_mapping: list(range(0,16))   # 16 卡训练（DP=16, TP=1, PP=1）
+actor_infer:
+  device_mapping: list(range(0,12))   # 12 卡推理（6 个 vLLM Worker）
+reference:
+  device_mapping: list(range(0,16))   # 16 卡，与 actor_train 共享
+```
+
+**为什么 actor_infer 只用 12 卡？** 因为 vLLM 推理不需要那么多卡，12 卡已经足够处理 64 × 8 = 512 个生成请求。剩余 4 卡给 LLM Judge Reward Worker 使用（LLM Judge 也需要 GPU）。
+
+##### 8 卡配置的差异
+
+对比 `rlvr_config_8gpus.yaml`，8 卡配置的主要调整：
+
+| 参数 | 16 卡 | 8 卡 | 调整原因 |
+|------|-------|------|---------|
+| `gradient_accumulation_steps` | 32 | 64 | dp_size 减半，累积步数翻倍以保持总 batch size |
+| `actor_train.device_mapping` | range(0,16) | range(0,8) | GPU 数量减半 |
+| `actor_infer.device_mapping` | range(0,12) | range(0,6) | 推理卡数相应减少 |
+| `reference.device_mapping` | range(0,16) | range(0,8) | 与训练共享 |
+
+#### 2.3 多任务混合训练的数据配置
+
+我们的 RLVR 训练同时覆盖 5 个任务域：
+
+```yaml
+data_args:
+  file_name:
+    - data/code_KodCode_data.jsonl           # 代码任务
+    - data/llm_judge_Multi-subject-RLVR_deal_new.jsonl  # LLM 评判任务
+    - data/math_deepmath_deal.jsonl           # 数学任务
+    - data/general_ifeval_train_deal.jsonl    # 指令遵循
+    - data/general_CrossThink-QA_deal.jsonl   # 跨领域 QA
+  domain_interleave_probs:
+    math_rule: 0.4       # 40% 数学（主力任务）
+    code_sandbox: 0.3     # 30% 代码
+    llm_judge: 0.1        # 10% LLM 评判
+    crossthinkqa: 0.1     # 10% 跨领域 QA
+    ifeval: 0.1           # 10% 指令遵循
+```
+
+**采样比例的选择逻辑**：
+- 数学和代码是核心能力，占比最高
+- LLM Judge / CrossThinkQA / IFEval 是辅助任务，防止模型能力退化
+- 比例可以根据验证集表现动态调整
+
+**每个任务域对应不同的 Reward Worker**：
+
+| 任务域 | Reward Worker | 奖励类型 | 是否需要 GPU |
+|--------|--------------|---------|-------------|
+| `math_rule` | MathRuleRewardWorker | 规则匹配（精确答案比对） | ❌ |
+| `code_sandbox` | CodeSandboxRewardWorker | 代码沙箱执行 | ❌ |
+| `llm_judge` | LLMJudgeRewardWorker | LLM 作为评判者 | ✅（需要独立 GPU） |
+| `ifeval` | GeneralRuleRewardWorker | 指令遵循规则验证 | ❌ |
+| `crossthinkqa` | CrossThinkQARuleRewardWorker | QA 规则验证 | ❌ |
+
+> ⚠️ **LLM Judge 的 GPU 不能和 Actor Infer 共享**，配置文件里有注释提醒：`# NOTE: llm as judge 也需要gpu, 不能和actor infer共享gpu`
+
+#### 2.4 验证集配置
+
+```yaml
+validation:
+  data_args:
+    template: qwen2_5
+    file_name:
+      - data/math_benchmarks.jsonl
+  generating_args:
+    max_new_tokens: ${response_length}
+    top_p: 0.6          # 验证时用较低温度，追求确定性
+    temperature: 0.6     # 与训练时的 0.99 不同
+    num_return_sequences: 1  # 验证只生成 1 个 response
+```
+
+**训练 vs 验证的生成参数差异**：训练时用高温度（0.99）鼓励探索，验证时用低温度（0.6）追求最佳表现。
+
+---
+
+### 三、Agentic RL 训练实践
+
+#### 3.1 启动方式
+
+```bash
+# 本地启动
+ray stop --force           # 先清理旧的 Ray 进程
+fuser -k 6379/tcp          # 释放 Redis 端口
+python examples/start_agentic_pipeline.py \
+    --config_path qwen3-4b-2507-agentic \
+    --config_name agentic_amap
+```
+
+> ⚠️ Agentic 训练前**必须先 `ray stop --force`**，否则残留的 Ray 进程会导致资源冲突。
+
+#### 3.2 我们实际使用的训练参数（Qwen3-4B Agentic）
+
+以 `examples/qwen3-4b-2507-agentic/agentic_amap.yaml` 为例：
+
+##### 与 RLVR 的关键差异
+
+| 参数 | RLVR (7B) | Agentic (4B) | 差异原因 |
+|------|-----------|-------------|---------|
+| `sequence_length` | 6144 (prompt+response) | 40960 | 多轮交互轨迹很长 |
+| `rollout_batch_size` | 64 | 512 | Agentic 需要更多环境并行 |
+| `adv_estimator` | reinforce | grpo | GRPO 在 Agentic 场景效果更好 |
+| `max_grad_norm` | 未设置 | 1.0 | 多轮交互梯度波动大，需要裁剪 |
+| `use_kl_loss` | false | true (coef=0.001) | 防止策略偏离过大 |
+| `async_generation_ratio` | 未使用 | 4 | 异步生成，提高吞吐 |
+| `lr_scheduler_type` | linear | cosine | Cosine 调度在长训练中更稳定 |
+
+##### Agentic 特有参数
+
+| 参数 | 实际值 | 说明 |
+|------|--------|------|
+| `max_tokens_per_step` | 4096 | 每轮交互 Agent 最多生成 4096 token |
+| `max_actions_per_traj` | 15 | 每条轨迹最多 15 轮交互 |
+| `async_generation_ratio` | 4 | 异步生成比例，4 表示同时跑 4 倍的环境 |
+| `enable_thinking` | true | 启用 thinking 模式（Qwen3 特有） |
+
+##### 环境管理器配置
+
+```yaml
+train_env_manager:
+  max_env_num_per_worker: 4    # 每个 Worker 最多管理 4 个环境
+  num_env_groups: 64           # 64 个环境组
+  group_size: 8                # 每组 8 个环境（同组共享 prompt 和 seed）
+  tags: [AmapReward]           # 环境类型标签
+
+val_env_manager:
+  group_size: 1                # 验证时 group_size=1，因为温度为 0，相同 prompt 输出相同
+```
+
+> **`group_size` 的含义**：同一组内的环境使用相同的 prompt 和 seed，生成不同的 response 用于 GRPO 组内对比。验证时设为 1 是因为温度为 0，相同输入必然产生相同输出，无需重复。
+
+##### GPU 资源分配（大规模 Agentic 训练）
+
+```yaml
+infer_device: list(range(0,16))      # 16 卡推理
+train_device: list(range(16,144))    # 128 卡训练
+```
+
+Agentic 训练通常需要更多的训练卡，因为：
+- `sequence_length=40960` 极长，单卡显存压力大
+- 使用 `context_parallel_size: 8` 将长序列切分到 8 张卡
+
+##### 动态 Batching 配置
+
+```yaml
+actor_train:
+  use_dynamic_batching_in_train: true
+  max_tokens_per_microbatch_in_train: 40960
+  sequence_length_round_in_train: 128
+```
+
+Agentic 训练的轨迹长度差异极大（有的 2 轮就结束，有的 15 轮），动态 batching 按 token 数而非样本数组 batch，避免 padding 浪费。
+
+#### 3.3 SFT 预训练模型的选择
+
+Agentic 训练通常不直接从 base 模型开始，而是先做 SFT：
+
+```yaml
+# 使用 SFT 后的模型作为起点
+pretrain: /data/oss_bucket_0/yihao/models/checkpoints/amap-tool-call-agent/Qwen3-4B-Thinking-2507-SFT-tool-call-7w_train_gemini_with_syn-v2.3-lr1e-6-20251224181651-checkpoint-396
+```
+
+**为什么不直接从 base 模型开始？** Agent 需要先学会基本的工具调用格式（如 function calling），否则 RL 训练初期几乎所有 response 都是无效的，奖励全为 0，无法学习。
+
+---
+
+### 四、关键训练参数调优指南
+
+#### 4.1 学习率
+
+| 场景 | 推荐学习率 | 说明 |
+|------|-----------|------|
+| RLVR 7B | 1.0e-6 | 标准选择 |
+| RLVR 72B | 5.0e-7 | 大模型用更小的学习率 |
+| Agentic 4B | 1.0e-6 | 与 RLVR 类似 |
+| SFT 预训练 | 1.0e-5 ~ 5.0e-6 | SFT 学习率比 RL 高一个数量级 |
+
+**经验法则**：如果训练过程中 reward 突然暴跌或 KL 散度飙升，第一件事就是降低学习率。
+
+#### 4.2 num_return_sequences_in_group
+
+| 值 | 适用场景 | 权衡 |
+|----|---------|------|
+| 4 | 资源有限 | 组内对比信息少，但推理开销小 |
+| 8 | **推荐默认值** | 平衡效果和开销 |
+| 16 | 追求最佳效果 | 推理开销翻倍，但 GRPO 效果更好 |
+
+#### 4.3 temperature 和 top_p
+
+| 阶段 | temperature | top_p | 说明 |
+|------|------------|-------|------|
+| 训练 Rollout | 0.99 | 0.99 | 高温度 + 高 top_p = 最大探索 |
+| 验证 | 0.6 | 0.6 | 低温度 = 追求最佳表现 |
+| LLM Judge | 0.8 | 0.8 | 中等温度，评判需要一定确定性 |
+
+#### 4.4 difficulty_mask 阈值
+
+```yaml
+difficulty_low_threshold: 0.1    # 正确率 < 10% 的 prompt 太难，过滤
+difficulty_high_threshold: 0.95  # 正确率 > 95% 的 prompt 太简单，过滤
+```
+
+**调优建议**：
+- 训练初期模型较弱，可以放宽下限到 0.05
+- 训练后期模型变强，可以收紧上限到 0.9
+- 如果发现 reward 不涨，检查是否大量数据被过滤掉了
+
+---
+
+### 五、Checkpoint 与断点续训
+
+#### 5.1 Checkpoint 保存
+
+```yaml
+checkpoint_config:
+  type: file_system
+  output_dir: /data/cpfs_0/rl_examples/models/${exp_name}
+
+save_steps: 100  # 每 100 步保存
+```
+
+Checkpoint 会保存到 `output_dir` 下，包含：
+- 模型权重（Megatron 格式或 HF 格式）
+- 优化器状态
+- 训练状态（step 数、学习率等）
+
+#### 5.2 断点续训
+
+```yaml
+resume_from_checkpoint: true  # 或指定具体路径
+# resume_from_checkpoint: /data/cpfs_0/rl_examples/models/qwen2.5-7B-rlvr-config/checkpoint-200
+```
+
+**断点续训注意事项**：
+- 确保 `output_dir` 下有有效的 checkpoint
+- 恢复时会自动加载优化器状态和学习率调度器
+- 如果改了 `device_mapping`（GPU 数量变了），需要重新转换 checkpoint
+
+#### 5.3 Megatron 模型转 HuggingFace 格式
+
+训练完成后，Megatron 格式的 checkpoint 需要转换为 HF 格式才能用于推理部署：
+
+```bash
+# 参考 README 中的链接
+# https://alibaba.github.io/ROLL/docs/User%20Guides/Advanced%20Features/megatron_convert_2_hf
+```
+
+---
+
+### 六、监控与指标追踪
+
+#### 6.1 追踪器配置
+
+```yaml
+# TensorBoard（默认）
+track_with: tensorboard
+tracker_kwargs:
+  log_dir: /data/oss_bucket_0/rl_examples/llm/tensorboard/roll_exp/rlvr
+
+# SwanLab（Agentic 训练常用）
+track_with: swanlab
+tracker_kwargs:
+  login_kwargs:
+    api_key: <your_api_key>
+  project: amap-agentic-roll
+  experiment_name: ${exp_name}
+
+# WandB
+track_with: wandb
+tracker_kwargs:
+  api_key: <your_api_key>
+  project: roll_examples
+```
+
+#### 6.2 关键监控指标
+
+| 指标 | 正常范围 | 异常信号 |
+|------|---------|---------|
+| **reward/mean** | 持续上升 | 突然暴跌 → 策略崩溃 |
+| **reward/std** | 逐渐下降 | 始终很大 → 训练不稳定 |
+| **kl_divergence** | 0.01 ~ 0.5 | >1.0 → 策略偏离过大 |
+| **policy_loss** | 逐渐下降 | 震荡不收敛 → 学习率过大 |
+| **entropy** | 缓慢下降 | 骤降到 0 → 模式坍缩 |
+| **response_length/mean** | 稳定或缓慢变化 | 突然变很短 → 模型学会了偷懒 |
+| **difficulty/filtered_ratio** | <50% | >80% → 数据被过度过滤 |
+
+---
+
+### 七、常见问题与排查
+
+#### 7.1 训练启动类问题
+
+##### 问题：Ray 启动失败，端口被占用
+
+```
+Error: Redis connection error
+```
+
+**解决**：
+```bash
+ray stop --force
+fuser -k 6379/tcp
+# 然后重新启动
+```
+
+##### 问题：NCCL 通信超时
+
+```
+RuntimeError: NCCL communicator was aborted
+```
+
+**排查步骤**：
+1. 检查 `NCCL_SOCKET_IFNAME` 是否正确（多节点用 `eth0`，单节点用 `bond0`）
+2. 检查防火墙是否放行了 NCCL 端口
+3. 增大 `rpc_timeout`（默认 3600 秒）
+4. 检查 `/dev/shm` 大小是否足够（需要 80G+）
+
+##### 问题：vLLM 启动时 OOM
+
+```
+torch.cuda.OutOfMemoryError: CUDA out of memory
+```
+
+**解决**：
+- 降低 `gpu_memory_utilization`（从 0.8 降到 0.7）
+- 降低 `max_model_len`（确保 ≥ prompt_length + response_length 即可）
+- 检查是否有其他进程占用 GPU 显存
+
+##### 问题：Hydra 配置解析错误
+
+```
+omegaconf.errors.ConfigAttributeError
+```
+
+**排查**：
+- 检查 YAML 中的 `${}` 引用是否都有对应的定义
+- 检查 `defaults` 引用的配置文件是否存在
+- 使用 `OmegaConf.to_yaml(cfg, resolve=True)` 打印解析后的完整配置
+
+#### 7.2 训练过程类问题
+
+##### 问题：Reward 始终为 0
+
+**可能原因**：
+1. **数据格式错误**：`ground_truth` 字段缺失或格式不对
+2. **tag 不匹配**：数据的 `tag` 和 Reward Worker 的 `tag_included` 对不上
+3. **模型太弱**：base 模型完全不会做这类任务，需要先 SFT
+4. **Reward Worker 报错但被静默吞掉**：检查 Reward Worker 的日志
+
+**排查方法**：
+```bash
+# 检查 rollout 轨迹
+python read_rollout_trajectory.py  # 项目根目录有这个脚本
+```
+
+##### 问题：Reward 上升后突然暴跌
+
+**可能原因**：
+1. **学习率过大**：策略更新步长太大，跳出了好的区域
+2. **KL 散度过大**：策略偏离参考模型太远
+3. **数据分布突变**：某个 domain 的数据突然变化
+
+**解决方案**：
+- 降低学习率到 5e-7
+- 启用 `add_token_level_kl: true`，设置 `init_kl_coef: 0.01`
+- 启用 `dual_clip_loss: true`
+- 从暴跌前的 checkpoint 恢复，用更保守的参数继续训练
+
+##### 问题：训练 loss 为 NaN
+
+**可能原因**：
+1. **梯度爆炸**：设置 `max_grad_norm: 1.0` 进行梯度裁剪
+2. **数据异常**：某些样本的 log_prob 计算出现 inf
+3. **精度问题**：FP16 溢出，改用 BF16
+
+##### 问题：模型生成的 response 越来越短
+
+**原因**：模型学会了"偷懒"——生成很短的回答也能获得部分奖励（或避免惩罚）。
+
+**解决方案**：
+- 检查 `max_len_mask` 是否开启（过滤截断样本）
+- 在 Reward 中加入长度惩罚：`response_length_penalty_coef`
+- 检查 Reward 设计是否有漏洞（短回答是否能获得高分）
+
+##### 问题：训练速度越来越慢
+
+**可能原因**：
+1. **response 越来越长**：模型学会了生成更长的 CoT，rollout 时间增加
+2. **显存碎片化**：vLLM 的 KV Cache 碎片化，重启 Actor Infer 可以缓解
+3. **数据加载瓶颈**：`preprocessing_num_workers` 设置过小
+
+#### 7.3 分布式相关问题
+
+##### 问题：模型同步（Model Update）卡住
+
+**排查**：
+1. 检查 Actor Train 和 Actor Infer 的 `device_mapping` 是否有交集（colocated 场景需要 offload/reload）
+2. 检查 NCCL 通信组是否正确建立
+3. 增大 `rpc_timeout`
+
+##### 问题：多节点训练时某个节点挂掉
+
+**现象**：训练突然卡住，日志不再更新。
+
+**排查**：
+1. 检查各节点的 GPU 状态：`nvidia-smi`
+2. 检查 Ray 集群状态：`ray status`
+3. 检查是否有 OOM Kill：`dmesg | grep -i oom`
+4. 从最近的 checkpoint 恢复训练
+
+##### 问题：Colocated 部署时 offload/reload 报错
+
+**解决**：
+- 确保 CPU 内存足够（offload 需要将模型参数暂存到 CPU）
+- 检查 `offload_nccl` 配置是否正确
+- 尝试切换到 disaggregated 部署（训练和推理使用不同 GPU）
+
+---
+
+### 八、性能优化 Checklist
+
+在正式开始大规模训练前，按以下清单逐项检查：
+
+- [ ] **GPU 利用率**：训练阶段 GPU 利用率应 >80%，如果很低说明有瓶颈
+- [ ] **Rollout 耗时**：Rollout 通常是最耗时的阶段，确认 vLLM 的 `gpu_memory_utilization` 和 `max_model_len` 设置合理
+- [ ] **数据加载**：`preprocessing_num_workers: 16` 确保数据预处理不成为瓶颈
+- [ ] **梯度累积**：确认 `gradient_accumulation_steps × dp_size × per_device_train_batch_size = rollout_batch_size × num_return_sequences_in_group`
+- [ ] **显存余量**：训练时 GPU 显存占用不超过 90%，留余量给动态分配
+- [ ] **Checkpoint 存储**：确认 `checkpoint_config.output_dir` 有足够的磁盘空间
+- [ ] **日志追踪**：确认 TensorBoard/SwanLab/WandB 正常记录指标
+- [ ] **验证集**：确认 `eval_steps` 设置合理，验证集能正常运行
+- [ ] **断点续训**：先跑几步，手动中断，测试 `resume_from_checkpoint` 是否正常
+
+---
+
+### 九、训练后的模型部署验证
+
+训练完成后，用 vLLM 快速验证模型效果：
+
+```bash
+# 启动 vLLM 推理服务
+nohup vllm serve /path/to/checkpoint/hf_model \
+   --dtype auto \
+   --tensor_parallel_size 2 \
+   --data_parallel_size 4 \
+   > vllm.log 2>&1 &
+
+# 如果是 Thinking 模型，加上 reasoning parser
+nohup vllm serve /path/to/checkpoint/hf_model \
+   --dtype auto \
+   --reasoning-parser deepseek_r1 \
+   --tensor_parallel_size 2 \
+   --data_parallel_size 4 \
+   > vllm.log 2>&1 &
+```
+
+然后通过 OpenAI 兼容 API 测试：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/path/to/checkpoint/hf_model",
+    "messages": [{"role": "user", "content": "计算 1+1=?"}],
+    "temperature": 0.6
+  }'
+```
